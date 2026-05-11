@@ -49,12 +49,14 @@ jobs:
         working-directory: ${{ matrix.directory }}
         run: terraform init
 
+      # Download the exact plan from PR
       - name: Download Plan Artifact
         uses: actions/download-artifact@v4
         with:
           name: tfplan-${{ matrix.directory }}
           path: ${{ matrix.directory }}
 
+      # Apply the exact plan (no replanning!)
       - name: Terraform Apply
         working-directory: ${{ matrix.directory }}
         run: terraform apply -input=false -auto-approve tfplan

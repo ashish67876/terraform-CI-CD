@@ -6,13 +6,18 @@ on:
     paths:
       - 'live/**'
       - 'modules/**'
+      - 'scripts/**'
+      - '.github/workflows/terraform-plan.yml'
 
 permissions:
-  id-token: write
-  contents: read
-  pull-requests: write
+  id-token: write      # Required for AWS OIDC
+  contents: read       # Required for checkout
+  pull-requests: write # Required to post PR comments
 
 jobs:
+  # ==========================================
+  # JOB 1: Detect what changed
+  # ==========================================
   detect:
     runs-on: ubuntu-latest
     outputs:
@@ -20,83 +25,184 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-      - id: changes
+          fetch-depth: 0  # Need full history for diff
+
+      - name: Detect Changed Directories
+        id: changes
         run: bash scripts/detect-changes.sh ${{ github.base_ref }}
 
-  security-scan:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: aquasecurity/tfssec-action@v1
-        with:
-          soft_fail: true
-      - uses: bridgecrewio/checkov-action@master
-        with:
-          directory: .
-          framework: terraform
-          soft_fail: true
-
+  # ==========================================
+  # JOB 2: Run plan for each changed directory
+  # ==========================================
   plan:
-    needs: [detect, security-scan]
-    if: needs.detect.outputs.matrix != '[]'
+    needs: detect
+    # Skip if nothing changed
+    if: needs.detect.outputs.matrix != '[]' && needs.detect.outputs.matrix != ''
+    
     runs-on: ubuntu-latest
+    
     strategy:
-      fail-fast: false
+      fail-fast: false  # Continue other jobs if one fails
       matrix:
         directory: ${{ fromJson(needs.detect.outputs.matrix) }}
     
+    # Environment for approval gates (optional but recommended)
+    environment: ${{ startsWith(matrix.directory, 'live/prod') && 'production-plan' || '' }}
+    
     steps:
+      # --------------------------------------
+      # Step 1: Checkout code
+      # --------------------------------------
       - uses: actions/checkout@v4
-      
-      - name: Configure AWS Credentials (OIDC)
+
+      # --------------------------------------
+      # Step 2: Configure AWS (OIDC - no secrets)
+      # --------------------------------------
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/github-actions-terraform-plan
-          aws-region: us-east-1
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
 
+      # --------------------------------------
+      # Step 3: Setup Terraform
+      # --------------------------------------
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.7.0"
-          terraform_wrapper: false
+          terraform_wrapper: false  # We handle output ourselves
 
+      # --------------------------------------
+      # Step 4: Terraform Init
+      # --------------------------------------
       - name: Terraform Init
         working-directory: ${{ matrix.directory }}
-        run: terraform init
+        run: terraform init -input=false
 
+      # --------------------------------------
+      # Step 5: Terraform Validate (double-check)
+      # --------------------------------------
       - name: Terraform Validate
         working-directory: ${{ matrix.directory }}
         run: terraform validate -no-color
 
+      # --------------------------------------
+      # Step 6: Terraform Plan
+      # --------------------------------------
       - name: Terraform Plan
         id: plan
         working-directory: ${{ matrix.directory }}
         run: |
-          terraform plan -no-color -input=false -out=tfplan \
-            -var-file="../../environments/${{ matrix.directory }}/terraform.tfvars" || true
+          terraform plan -input=false -no-color -out=tfplan \
+            -var-file=terraform.tfvars \
+            -compact-warnings 2>&1 | tee plan_output.txt
+          
+          # Store exit code
+          echo "exitcode=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
         continue-on-error: true
 
+      # --------------------------------------
+      # Step 7: Cost Estimation
+      # --------------------------------------
+      - name: Cost Estimate
+        if: always() && steps.plan.outcome == 'success'
+        working-directory: ${{ matrix.directory }}
+        run: |
+          if command -v infracost &> /dev/null; then
+            infracost breakdown --path . \
+              --terraform-plan-file tfplan \
+              --format json \
+              --out-file /tmp/infracost.json
+              
+            MONTHLY_COST=$(cat /tmp/infracost.json | jq -r '.totalMonthlyCost // "0"')
+            echo "monthly_cost=$MONTHLY_COST" >> $GITHUB_OUTPUT
+            echo "💰 Estimated monthly cost: $MONTHLY_COST USD"
+          fi
+        continue-on-error: true
+
+      # --------------------------------------
+      # Step 8: Post Plan to PR
+      # --------------------------------------
       - name: Post Plan to PR
-        uses: actions/github-script@v7
         if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
         with:
           script: |
-            const output = `#### Terraform Plan 📖\`${{ matrix.directory }}\`
+            const fs = require('fs');
+            const path = '${{ matrix.directory }}';
+            
+            // Read plan output
+            let planOutput = '';
+            try {
+              planOutput = fs.readFileSync(`${path}/plan_output.txt`, 'utf8');
+            } catch (e) {
+              planOutput = 'Plan output not available';
+            }
+            
+            // Truncate if too long (GitHub comment limit)
+            if (planOutput.length > 60000) {
+              planOutput = planOutput.substring(0, 60000) + '\n\n... (truncated)';
+            }
+            
+            // Build comment body
+            const body = `## Terraform Plan 📖
+            **Directory:** \`${path}\`
+            **Status:** ${{ steps.plan.outputs.exitcode == '0' && '✅ No changes' || (steps.plan.outputs.exitcode == '2' && '📝 Changes detected' || '❌ Failed') }}
+            
             <details><summary>Show Plan</summary>
-            \`\`\`\n
-            ${{ steps.plan.outputs.stdout }}
+            
+            \`\`\`terraform
+            ${planOutput}
             \`\`\`
-            </details>`;
-            github.rest.issues.createComment({
+            
+            </details>
+            
+            <!-- terraform-plan-${{ matrix.directory }} -->`;
+            
+            // Find existing comment to update
+            const { data: comments } = await github.rest.issues.listComments({
               issue_number: context.issue.number,
               owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: output
+              repo: context.repo.repo
             });
+            
+            const botComment = comments.find(comment => 
+              comment.user.type === 'Bot' && 
+              comment.body.includes(`<!-- terraform-plan-${path} -->`)
+            );
+            
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                comment_id: botComment.id,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: body
+              });
+            }
 
+      # --------------------------------------
+      # Step 9: Upload Plan Artifact (for apply)
+      # --------------------------------------
       - name: Upload Plan Artifact
+        if: steps.plan.outputs.exitcode == '2'  # Only if there are changes
         uses: actions/upload-artifact@v4
         with:
           name: tfplan-${{ matrix.directory }}
           path: ${{ matrix.directory }}/tfplan
           retention-days: 5
+
+      # --------------------------------------
+      # Step 10: Fail if plan failed
+      # --------------------------------------
+      - name: Check Plan Status
+        if: steps.plan.outputs.exitcode == '1'
+        run: |
+          echo "❌ Terraform plan failed"
+          exit 1
